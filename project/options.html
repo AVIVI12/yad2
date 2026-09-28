@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="he" dir="rtl">
+<head>
+  <meta charset="UTF-8" />
+  <title>Yad2 Watcher — הגדרות</title>
+  <link rel="stylesheet" href="options.css" />
+</head>
+<body>
+  <div class="container">
+    <header>
+      <img src="icons/icon48.png" alt="" class="logo" />
+      <h1>Yad2 Watcher — הגדרות</h1>
+    </header>
+
+    <section class="card">
+      <label for="searchUrl" class="label">קישור החיפוש ב-Yad2</label>
+      <p class="hint">העתק את הקישור המלא מדף החיפוש שלך ב-Yad2 (כולל הפילטרים) והדבק אותו כאן.</p>
+      <input id="searchUrl" type="url" class="input" placeholder="https://www.yad2.co.il/vehicles/cars?manufacturer=…" />
+
+      <label for="pollMinutes" class="label">תדירות בדיקה (דקות)</label>
+      <input id="pollMinutes" type="number" min="1" max="120" value="15" class="input small" />
+
+      <div class="checkbox-row">
+        <label class="switch">
+          <input id="enableNotifications" type="checkbox" />
+          <span class="slider"></span>
+        </label>
+        <span>הפעל התראות פופאפ</span>
+      </div>
+
+      <div class="checkbox-row">
+        <label class="switch">
+          <input id="enableSound" type="checkbox" />
+          <span class="slider"></span>
+        </label>
+        <span>השמע צליל עם ההתראה</span>
+      </div>
+
+      <div class="actions">
+        <button id="save" class="btn-primary">שמור</button>
+        <span id="saved" class="saved-msg">נשמר!</span>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>10 המודעות האחרונות</h2>
+      <div id="previewStatus" class="preview-status"></div>
+      <div id="preview" class="preview"></div>
+      <pre id="debugInfo" class="debug-info" style="display:none;"></pre>
+    </section>
+
+    <section class="card">
+      <h2>איך זה עובד</h2>
+      <p>התוסף בודק כל <span id="intervalLabel">15</span> דקות את דף החיפוש שלך ב-Yad2. בכל בדיקה הוא משווה את המודעות הנוכחיות לאלו שכבר ראה, ואם יש מודעות חדשות — מקפיץ פופאפ עם פרטי המודעה וקישור אליה.</p>
+      <p>הבדיקה הראשונה אחרי שמירת ההגדרות רק שומרת את רשימת המודעות הנוכחית (כדי לא להציף אותך בהתראות). מהבדיקה השנייה ואילך תקבל התראה רק על מודעות שעלו אחרי הבדיקה הקודמת.</p>
+      <p>בשמירת ההגדרות התוסף מבצע מיד בדיקה ראשונה ומציג את 10 המודעות האחרונות למטה.</p>
+    </section>
+
+    <section class="card">
+      <h2>הערה חשובה</h2>
+      <p>כלי זה מיועד לשימוש אישי בלבד, לבדיקת חיפושים שמורים שלך. כבד את תנאי השימוש של Yad2 והשתמש בתדירות סבירה (ברירת המחדל: כל רבע שעה). אם Yad2 חוסם את הבקשות, פתח את Yad2 בדפדפן פעם אחת כדי לעבור את האתגר.</p>
+    </section>
+  </div>
+
+  <script src="options.js"></script>
+</body>
+</html>

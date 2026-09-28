@@ -1,0 +1,186 @@
+:root {
+  --bg: #0f172a;
+  --surface: #1e293b;
+  --surface-2: #334155;
+  --border: #475569;
+  --text: #f1f5f9;
+  --text-muted: #94a3b8;
+  --accent: #38bdf8;
+  --accent-2: #0ea5e9;
+  --success: #22c55e;
+  --warning: #f59e0b;
+  --error: #ef4444;
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+  font-family: "Segoe UI", "Heebo", system-ui, -apple-system, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  font-size: 15px;
+  line-height: 1.6;
+  min-height: 100vh;
+}
+
+.container {
+  max-width: 640px;
+  margin: 0 auto;
+  padding: 32px 20px 60px;
+}
+
+header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 24px;
+}
+.logo { width: 40px; height: 40px; border-radius: 8px; }
+header h1 { font-size: 22px; font-weight: 700; }
+
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 22px;
+  margin-bottom: 16px;
+}
+.card h2 { font-size: 16px; margin-bottom: 10px; }
+.card p { color: var(--text-muted); margin-bottom: 10px; }
+.card p:last-child { margin-bottom: 0; }
+
+.label {
+  display: block;
+  font-weight: 600;
+  margin-bottom: 4px;
+  margin-top: 16px;
+}
+.label:first-of-type { margin-top: 0; }
+
+.hint { font-size: 13px; color: var(--text-muted); margin-bottom: 8px; }
+
+.input {
+  width: 100%;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  color: var(--text);
+  padding: 10px 12px;
+  border-radius: 8px;
+  font-size: 14px;
+  font-family: inherit;
+  transition: border-color 0.15s;
+}
+.input:focus { outline: none; border-color: var(--accent); }
+.input.small { width: 120px; }
+
+.checkbox-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 16px;
+}
+
+.switch {
+  position: relative;
+  display: inline-block;
+  width: 44px;
+  height: 24px;
+}
+.switch input { opacity: 0; width: 0; height: 0; }
+.slider {
+  position: absolute;
+  cursor: pointer;
+  inset: 0;
+  background: var(--border);
+  border-radius: 12px;
+  transition: background 0.2s;
+}
+.slider::before {
+  content: "";
+  position: absolute;
+  height: 18px; width: 18px;
+  right: 3px; top: 3px;
+  background: #fff;
+  border-radius: 50%;
+  transition: transform 0.2s;
+}
+.switch input:checked + .slider { background: var(--accent-2); }
+.switch input:checked + .slider::before { transform: translateX(-20px); }
+
+.actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 22px;
+}
+
+.btn-primary {
+  background: var(--accent-2);
+  border: none;
+  color: #fff;
+  padding: 10px 24px;
+  border-radius: 8px;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.15s, transform 0.1s;
+  font-family: inherit;
+}
+.btn-primary:hover { background: var(--accent); }
+.btn-primary:active { transform: scale(0.97); }
+.btn-primary:disabled { opacity: 0.6; cursor: default; }
+
+.saved-msg {
+  color: var(--success);
+  font-size: 13px;
+  opacity: 0;
+  transition: opacity 0.3s;
+}
+.saved-msg.show { opacity: 1; }
+
+/* ---------- preview ---------- */
+
+.preview-status {
+  font-size: 13px;
+  color: var(--text-muted);
+  margin-bottom: 12px;
+}
+.preview-status.ok { color: var(--success); }
+.preview-status.err { color: var(--error); }
+
+.preview {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.preview-empty {
+  padding: 24px;
+  text-align: center;
+  color: var(--text-muted);
+  font-size: 14px;
+  background: var(--surface-2);
+  border-radius: 8px;
+  border: 1px dashed var(--border);
+}
+
+.preview-listing {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 12px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  cursor: pointer;
+  transition: border-color 0.15s, background 0.15s;
+  text-decoration: none;
+  color: inherit;
+}
+.preview-listing:hover { border-color: var(--accent); }
+
+.preview-top { display: flex; justify-content: space-between; align-items: baseline; }
+.preview-price { font-size: 16px; font-weight: 700; color: var(--accent); }
+.preview-year { font-size: 13px; color: var(--text-muted); }
+.preview-model { font-size: 14px; font-weight: 500; }
+.preview-meta { font-size: 12px; color: var(--text-muted); }
