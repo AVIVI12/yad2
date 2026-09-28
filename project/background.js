@@ -1,764 +1,230 @@
-// Yad2 Watcher — background service worker (MV3)
-// Polls a saved Yad2 car search every 15 minutes, diffs listing tokens against
-// what we've already seen, and pops a notification + badge for new ads.
-//
-// Yad2 fronts its pages with a Radware/ShieldSquare JS challenge. A raw fetch()
-// from the service worker gets blocked because the challenge needs a real
-// browser to run its JavaScript. Instead, we open a hidden tab, let the browser
-// solve the challenge naturally, and inject a content script that extracts
-// listings from the rendered page — first trying __NEXT_DATA__ JSON, then
-// falling back to parsing the DOM cards directly.
-
 const ALARM_NAME = "yad2-poll";
-const POLL_MINUTES = 15;
+const DEFAULT_URL = "https://www.yad2.co.il/vehicles/cars";
 const STATE_KEY = "watcherState";
 const SETTINGS_KEY = "watcherSettings";
-
-// Feed buckets that are recommendations, not results of the user's search.
-const IGNORE_FEED_KEYS = new Set(["lookalike"]);
-
-// ---------- defaults ----------
-
 const DEFAULT_SETTINGS = {
-  searchUrl: "",
+  searchUrl: DEFAULT_URL,
   pollMinutes: 15,
   enableNotifications: true,
-  enableSound: true,
+  enableSound: false,
 };
 
-// ---------- state ----------
-
 async function getState() {
-  const data = await chrome.storage.local.get(STATE_KEY);
-  return data[STATE_KEY] || { tokens: [], listings: [], lastCheck: null, captchaStreak: 0, _seeded: false };
+  const { [STATE_KEY]: state } = await chrome.storage.local.get(STATE_KEY);
+  return state || { tokens: [], listings: [], lastCheck: null, captchaStreak: 0, _seeded: false };
 }
-
-async function saveState(state) {
-  await chrome.storage.local.set({ [STATE_KEY]: state });
-}
-
+async function saveState(state) { await chrome.storage.local.set({ [STATE_KEY]: state }); }
 async function getSettings() {
-  const data = await chrome.storage.local.get(SETTINGS_KEY);
-  return { ...DEFAULT_SETTINGS, ...(data[SETTINGS_KEY] || {}) };
+  const { [SETTINGS_KEY]: settings } = await chrome.storage.local.get(SETTINGS_KEY);
+  return { ...DEFAULT_SETTINGS, ...(settings || {}) };
 }
+async function saveSettings(settings) { await chrome.storage.local.set({ [SETTINGS_KEY]: settings }); }
 
-async function saveSettings(settings) {
-  await chrome.storage.local.set({ [SETTINGS_KEY]: settings });
-}
-
-// ---------- fetch via truly hidden window ----------
-
-/**
- * Open a truly hidden window far off-screen, let Yad2's JS challenge
- * resolve naturally, then poll the page content until listings appear.
- * Tries __NEXT_DATA__ first, falls back to DOM card parsing.
- * Closes window after polling completes.
- */
+// A popup window positioned outside the desktop is used because MV3 has no
+// general-purpose invisible tab API. It is never focused and is always closed.
 async function fetchPage(url) {
   let win;
-  let tabId;
-  let winId;
-  
   try {
-    // Create the window completely off-screen (far to the left and top)
-    // Using a normal popup window positioned outside viewport
     win = await chrome.windows.create({
-      url: "about:blank",
+      url,
       type: "popup",
       focused: false,
+      left: -10000,
+      top: -10000,
       width: 1024,
       height: 768,
-      left: -10000,    // Far off-screen to the left
-      top: -10000,     // Far off-screen to the top
     });
-    
-    tabId = win.tabs[0].id;
-    winId = win.id;
-    
-    if (!tabId || !winId) {
-      throw new Error("Failed to create window/tab");
-    }
-
-    // Navigate to the actual URL
-    await chrome.tabs.update(tabId, { url });
-    
-    console.log(`[yad2-watcher] opened hidden window at tab ${tabId}, window ${winId}`);
-    
-  } catch (e) {
-    console.error("[yad2-watcher] failed to create hidden window:", e);
-    
-    // Fallback: try a plain inactive tab
-    let fallbackTab;
+    const tabId = win?.tabs?.[0]?.id;
+    if (!tabId) throw new Error("hidden tab was not created");
+    try { return await pollTabForListings(tabId); }
+    finally { try { await chrome.windows.remove(win.id); } catch {} }
+  } catch (error) {
+    if (win?.id) { try { await chrome.windows.remove(win.id); } catch {} }
+    // Fallback for platforms that reject off-screen popup coordinates.
+    let tab;
     try {
-      fallbackTab = await chrome.tabs.create({ url, active: false });
-      tabId = fallbackTab.id;
-      
-      try {
-        const result = await pollTabForListings(tabId);
-        return result;
-      } finally {
-        if (tabId) {
-          try {
-            await chrome.tabs.remove(tabId);
-          } catch (e3) {
-            // already closed
-          }
-        }
-      }
-    } catch (e2) {
-      throw new Error("cannot open tab or window: " + e2.message);
-    }
-  }
-
-  // Poll the hidden tab
-  try {
-    return await pollTabForListings(tabId);
-  } finally {
-    // Clean up: close the window
-    if (winId) {
-      try {
-        await chrome.windows.remove(winId);
-        console.log(`[yad2-watcher] closed hidden window ${winId}`);
-      } catch (e) {
-        // Window already closed
-        console.warn(`[yad2-watcher] failed to close window ${winId}:`, e.message);
-      }
+      tab = await chrome.tabs.create({ url, active: false });
+      return await pollTabForListings(tab.id);
+    } finally {
+      if (tab?.id) { try { await chrome.tabs.remove(tab.id); } catch {} }
     }
   }
 }
 
-/**
- * Poll a tab's content repeatedly until listings are found or timeout.
- * The Radware challenge page redirects after a few seconds, and then
- * React needs time to render the listing cards.
- */
 async function pollTabForListings(tabId) {
-  const MAX_ATTEMPTS = 8;
-  const POLL_INTERVAL = 2500;
-
-  for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
-    // Wait for the page to reach "complete" first (handles redirect).
+  for (let attempt = 0; attempt < 10; attempt++) {
+    try { await waitForTabComplete(tabId, 20000); } catch {}
+    await sleep(attempt === 0 ? 4000 : 2500);
     try {
-      await waitForTabComplete(tabId, 20000);
-    } catch (e) {
-      // timeout — try extraction anyway
-      console.warn(`[yad2-watcher] tab load timeout on attempt ${attempt + 1}:`, e.message);
-    }
-
-    // Give the page time to render after load.
-    await sleep(attempt === 0 ? 3000 : POLL_INTERVAL);
-
-    let result;
-    try {
-      [result] = await chrome.scripting.executeScript({
-        target: { tabId },
-        func: extractFromPage,
-      });
-    } catch (e) {
-      // Tab may have navigated during injection — try again next loop.
-      console.warn(`[yad2-watcher] script injection attempt ${attempt + 1} failed:`, e.message);
-      continue;
-    }
-
-    if (!result || !result.result) {
-      console.warn(`[yad2-watcher] attempt ${attempt + 1}: no result returned`);
-      continue;
-    }
-
-    const r = result.result;
-    if (r.ok) {
-      console.log(`[yad2-watcher] successfully extracted listings on attempt ${attempt + 1}`);
-      return r;
-    }
-
-    // If it's a challenge page, keep waiting — the redirect hasn't happened yet.
-    if (r.reason === "challenge-page") {
-      console.log(`[yad2-watcher] attempt ${attempt + 1}: still on challenge page, waiting…`);
-      continue;
-    }
-
-    // If no listings found yet, keep polling — React may still be rendering.
-    if (r.reason === "no-listings-found" || r.reason === "no-listings-parsed") {
-      console.log(`[yad2-watcher] attempt ${attempt + 1}: no listings yet, waiting…`);
-      continue;
-    }
-
-    // Any other error — return it.
-    console.warn(`[yad2-watcher] attempt ${attempt + 1}: error reason: ${r.reason}`);
-    return r;
+      const [response] = await chrome.scripting.executeScript({ target: { tabId }, func: extractFromPage });
+      if (response?.result?.ok) return response.result;
+      if (response?.result?.reason === "challenge-page") continue;
+      if (response?.result?.reason === "no-listings-found" || response?.result?.reason === "no-listings-parsed") continue;
+      if (response?.result) return response.result;
+    } catch {}
   }
-
-  console.error("[yad2-watcher] polling timeout after all attempts");
   return { ok: false, reason: "timeout" };
 }
 
-/**
- * Runs in the page context. Tries __NEXT_DATA__ first, then DOM parsing.
- */
+// Runs inside the Yad2 page. Current Yad2 uses /item/<token>, not
+// /vehicles/item/<token>; both formats are accepted for compatibility.
 function extractFromPage() {
   const pageUrl = location.href;
-  const pageTitle = document.title;
-
-  // Check if we're still on a Radware challenge page.
-  if (pageTitle.includes("Radware") || document.body?.textContent?.includes("ShieldSquare")) {
-    return { ok: false, reason: "challenge-page", debug: { pageUrl, pageTitle } };
-  }
-
-  // Debug info for diagnostics.
+  const pageTitle = document.title || "";
+  const bodyText = document.body?.textContent || "";
   const debug = {
     pageUrl,
     pageTitle,
-    linkCount: document.querySelectorAll("a").length,
-    bodyLength: document.body?.textContent?.length || 0,
     hasNextData: !!document.getElementById("__NEXT_DATA__"),
-    bodySnippet: (document.body?.textContent || "").slice(0, 300),
-    itemLinks: document.querySelectorAll('a[href*="vehicles/item"]').length,
-    itemLinks2: document.querySelectorAll('a[href*="/vehicles/item/"]').length,
-    allHrefs: Array.from(document.querySelectorAll("a[href]"))
-      .map((a) => a.getAttribute("href"))
-      .filter((h) => h && h.includes("item"))
-      .slice(0, 5),
+    itemLinks: document.querySelectorAll('a[href*="item/"]').length,
+    bodyLength: bodyText.length,
   };
-
-  // --- Approach 1: __NEXT_DATA__ JSON ---
-  const nextDataEl = document.getElementById("__NEXT_DATA__");
-  if (nextDataEl) {
-    try {
-      const json = nextDataEl.textContent;
-      const data = JSON.parse(json);
-      // Yad2 stores listings in dehydratedState.queries[].state.data.ads[]
-      const queries = data?.props?.pageProps?.dehydratedState?.queries || [];
-      for (const q of queries) {
-        const d = q?.state?.data;
-        if (d && typeof d === "object" && Array.isArray(d.ads) && d.pagination) {
-          return { ok: true, method: "nextdata", json };
-        }
-      }
-    } catch (e) {
-      // JSON parse failed, fall through to DOM
-    }
+  if (/Radware|ShieldSquare|Access Denied/i.test(`${pageTitle} ${bodyText.slice(0, 2000)}`)) {
+    return { ok: false, reason: "challenge-page", debug };
   }
 
-  // --- Approach 2: Parse rendered DOM cards ---
-  // Yad2 renders each listing as a card with a link to /vehicles/item/{token}.
-  // We find all such links and extract data from the surrounding card element.
-  // Try multiple selectors — Yad2 may use different href formats.
-  let links = document.querySelectorAll('a[href*="/vehicles/item/"]');
-  if (links.length === 0) {
-    links = document.querySelectorAll('a[href*="vehicles/item"]');
-  }
-  if (links.length === 0) {
-    // Yad2 uses relative hrefs like "item/0tupynvy?..."
-    links = document.querySelectorAll('a[href*="item/"]');
-  }
-  if (links.length === 0) {
-    // Maybe the page uses onclick or data attributes instead of href.
-    // Look for any element with a data-token or data-id attribute.
-    const dataEls = document.querySelectorAll('[data-token], [data-id], [data-listing-id]');
-    if (dataEls.length > 0) {
-      links = dataEls;
-    }
-  }
-  if (links.length === 0) {
-    // Last resort: check if the page has any car-related content at all.
-    const bodyText = document.body?.textContent || "";
-    const hasPrice = /₪/.test(bodyText);
-    const hasCarInfo = /יד\s*\d|שנתון|ק״מ|km/i.test(bodyText);
-    if (!hasPrice && !hasCarInfo) {
-      return { ok: false, reason: "no-listings-found", debug };
-    }
-    // Page has car content but no clickable links — return empty.
-    return { ok: false, reason: "no-listings-found", debug };
-  }
-
+  const links = Array.from(document.querySelectorAll('a[href*="item/"]'));
   const listings = [];
   const seen = new Set();
-
   for (const link of links) {
-    try {
-      const href = link.getAttribute("href") || "";
-      // Match both full (/vehicles/item/xxx) and relative (item/xxx) hrefs.
-      const match = href.match(/(?:\/vehicles\/)?item\/([a-z0-9]+)/);
-      if (!match) continue;
-      const token = match[1];
-      if (seen.has(token)) continue;
-      seen.add(token);
+    const href = link.getAttribute("href") || "";
+    // Handles /item/g037trj0?... and /vehicles/item/g037trj0?... and absolute URLs.
+    const match = href.match(/(?:^|\/)item\/([A-Za-z0-9_-]+)/i);
+    if (!match || seen.has(match[1])) continue;
+    const token = match[1];
+    seen.add(token);
 
-      // Walk up to find the card container.
-      let card = link;
-      for (let i = 0; i < 8; i++) {
-        if (!card.parentElement) break;
-        card = card.parentElement;
-        // Yad2 card containers typically have a class with "card" or "feed" or data attributes.
-        const cls = card.className || "";
-        if (cls.includes("card") || cls.includes("feedItem") || cls.includes("listing")) {
-          break;
-        }
-      }
-
-      const cardText = (card.textContent || "").trim();
-      const cardHtml = card.innerHTML || "";
-
-      // Extract image URL.
-      const imgEl = card.querySelector("img");
-      const image = imgEl ? imgEl.src || imgEl.getAttribute("data-src") || "" : "";
-
-      // Extract title from the heading (## in markdown = h2 in DOM).
-      const headingEl = card.querySelector("h2, h3, [class*='title'], [class*='model']");
-      const title = headingEl ? headingEl.textContent.trim() : "";
-
-      // Parse price: look for a number followed by ₪.
-      const priceMatch = cardText.match(/([\d,]+)\s*₪/);
-      const price = priceMatch ? parseInt(priceMatch[1].replace(/,/g, ""), 10) : null;
-
-      // Parse year: the production year appears right before "•" (e.g. "2019 • יד 2").
-      // Some cards include a model range like [2012-2016] — the actual year is
-      // the one immediately before the • separator.
-      const yearBeforeDot = cardText.match(/(19[5-9]\d|20[0-4]\d)\s*•/);
-      const yearMatch = yearBeforeDot || cardText.match(/\b(19[5-9]\d|20[0-4]\d)\b/);
-      const year = yearMatch ? parseInt(yearMatch[1], 10) : null;
-
-      // Parse hand (יד): "יד 1", "יד 2", etc.
-      const handMatch = cardText.match(/יד\s*(\d+)/);
-      const hand = handMatch ? `יד ${handMatch[1]}` : "?";
-
-      // Parse km: look for "km" or "ק״מ" followed by/preceding a number.
-      const kmMatch = cardText.match(/([\d,]+)\s*(km|ק״מ|ק"מ)/i);
-      const km = kmMatch ? parseInt(kmMatch[1].replace(/,/g, ""), 10) : null;
-
-      // Extract model from the title (manufacturer + model).
-      const model = title || "";
-
-      // Extract area/city from the card text.
-      // Yad2 cards often show the city name near the end.
-      const areaEl = card.querySelector("[class*='area'], [class*='city'], [class*='location']");
-      const area = areaEl ? areaEl.textContent.trim() : "";
-
-      // Check for price drop indicator.
-      const priceDropped = cardText.includes("ירד ב");
-
-      listings.push({
-        token,
-        price,
-        year,
-        hand,
-        km,
-        engine: "?",
-        submodel: "",
-        model,
-        area: area || "?",
-        city: "",
-        createdAt: "",
-        url: `https://www.yad2.co.il/vehicles/item/${token}`,
-        image,
-        priceDropped,
-      });
-    } catch (e) {
-      // skip this listing on any error
+    let card = link;
+    for (let i = 0; i < 8 && card.parentElement; i++) {
+      card = card.parentElement;
+      const cls = typeof card.className === "string" ? card.className : "";
+      if (/card|feed|listing|item/i.test(cls)) break;
     }
+    const text = (card.textContent || "").replace(/\s+/g, " ").trim();
+    const heading = card.querySelector("h1,h2,h3,[class*='title'],[class*='model']");
+    const priceMatch = text.match(/([\d,]+)\s*₪/);
+    const yearMatch = text.match(/\b((?:19|20)\d{2})\b/);
+    const kmMatch = text.match(/([\d,]+)\s*(?:km|ק״מ|ק\"מ)/i);
+    const handMatch = text.match(/יד\s*(\d+)/);
+    const area = card.querySelector("[class*='area'],[class*='city'],[class*='location']");
+    listings.push({
+      token,
+      price: priceMatch ? Number(priceMatch[1].replace(/,/g, "")) : null,
+      year: yearMatch ? Number(yearMatch[1]) : null,
+      hand: handMatch ? `יד ${handMatch[1]}` : "?",
+      km: kmMatch ? Number(kmMatch[1].replace(/,/g, "")) : null,
+      engine: "?",
+      submodel: "",
+      model: heading?.textContent?.trim() || "",
+      area: area?.textContent?.trim() || "?",
+      city: "",
+      createdAt: "",
+      url: new URL(href, location.origin).href,
+      image: card.querySelector("img")?.src || "",
+    });
   }
-
-  if (listings.length === 0) {
-    return { ok: false, reason: "no-listings-parsed", debug };
-  }
-
+  if (!listings.length) return { ok: false, reason: "no-listings-found", debug };
   return { ok: true, method: "dom", listings };
 }
 
 function waitForTabComplete(tabId, timeoutMs) {
   return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => {
+    let done = false;
+    const finish = (error, tab) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
       chrome.tabs.onUpdated.removeListener(listener);
-      reject(new Error("tab load timeout"));
-    }, timeoutMs);
-
-    function listener(id, info, tab) {
-      if (id === tabId && info.status === "complete") {
-        clearTimeout(timer);
-        chrome.tabs.onUpdated.removeListener(listener);
-        resolve(tab);
-      }
-    }
-
-    chrome.tabs.get(tabId, (tab) => {
-      if (chrome.runtime.lastError) {
-        clearTimeout(timer);
-        chrome.tabs.onUpdated.removeListener(listener);
-        reject(new Error(chrome.runtime.lastError.message));
-        return;
-      }
-      if (tab.status === "complete") {
-        clearTimeout(timer);
-        chrome.tabs.onUpdated.removeListener(listener);
-        resolve(tab);
-      } else {
-        chrome.tabs.onUpdated.addListener(listener);
-      }
-    });
+      error ? reject(error) : resolve(tab);
+    };
+    const timer = setTimeout(() => finish(new Error("tab load timeout")), timeoutMs);
+    const listener = (id, info, tab) => {
+      if (id === tabId && info.status === "complete") finish(null, tab);
+    };
+    chrome.tabs.onUpdated.addListener(listener);
+    chrome.tabs.get(tabId).then(tab => tab.status === "complete" ? finish(null, tab) : null).catch(finish);
   });
 }
+function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
 
-function sleep(ms) {
-  return new Promise((r) => setTimeout(r, ms));
-}
-
-// ---------- parse __NEXT_DATA__ ----------
-
-function parseNextDataJson(jsonText) {
-  try {
-    return JSON.parse(jsonText);
-  } catch {
-    return null;
-  }
-}
-
-/**
- * Extract listing dicts from __NEXT_DATA__.
- */
-function parseListingsFromNextData(data) {
-  if (!data) return null;
-
-  const queries =
-    data?.props?.pageProps?.dehydratedState?.queries || [];
-  let feed = null;
-  for (const q of queries) {
-    const d = q?.state?.data;
-    if (d && typeof d === "object" && Array.isArray(d.ads) && d.pagination) {
-      feed = d;
-      break;
-    }
-  }
-  if (!feed) return null;
-
-  const listings = [];
-  const seen = new Set();
-  for (const it of feed.ads) {
-    if (!it || typeof it !== "object") continue;
-    const token = it.token;
-    if (!token || seen.has(token)) continue;
-    seen.add(token);
-    listings.push(extractCarFromNextData(it));
-  }
-  return listings;
-}
-
-function extractCarFromNextData(it) {
-  const token = it.token;
-  return {
-    token,
-    price: it.price ?? null,
-    year: it.vehicleDates?.yearOfProduction ?? null,
-    hand: it.hand?.text ?? "?",
-    km: it.km ?? null,
-    engine: it.engineType?.text ?? "?",
-    submodel: it.subModel?.text ?? "",
-    model: `${it.manufacturer?.text ?? ""} ${it.model?.text ?? ""}`.trim(),
-    area: it.address?.area?.text ?? "?",
-    city: it.address?.city?.text ?? "",
-    createdAt: it.createdAt ?? "",
-    url: `https://www.yad2.co.il/vehicles/item/${token}`,
-  };
-}
-
-/**
- * Sort listings by createdAt descending (most recent first).
- * Listings without createdAt keep their original order (stable sort).
- */
 function sortByRecent(listings) {
-  return [...listings].sort((a, b) => {
-    const ta = a.createdAt ? new Date(a.createdAt).getTime() : 0;
-    const tb = b.createdAt ? new Date(b.createdAt).getTime() : 0;
-    return tb - ta;
-  });
+  return [...listings].sort((a, b) => (new Date(b.createdAt || 0)) - (new Date(a.createdAt || 0)));
 }
-
-// ---------- diff + notify ----------
 
 async function pollOnce() {
   const settings = await getSettings();
-  if (!settings.searchUrl) {
-    console.log("[yad2-watcher] no search URL configured");
-    return { ok: false, reason: "no-url" };
-  }
+  const url = settings.searchUrl || DEFAULT_URL;
+  let result;
+  try { result = await fetchPage(url); }
+  catch (error) { await setBadgeError(); return { ok: false, reason: "fetch-error", error: String(error) }; }
 
-  let fetchResult;
-  try {
-    fetchResult = await fetchPage(settings.searchUrl);
-  } catch (e) {
-    console.error("[yad2-watcher] fetch failed", e);
-    await setBadgeError();
-    return { ok: false, reason: "fetch-error", error: String(e) };
-  }
-
-  if (!fetchResult.ok) {
-    console.warn("[yad2-watcher] extraction failed:", fetchResult.reason);
-    const state = await getState();
+  const state = await getState();
+  if (!result.ok || !result.listings?.length) {
     state.captchaStreak = (state.captchaStreak || 0) + 1;
     state.lastCheck = Date.now();
     await saveState(state);
-    if (state.captchaStreak >= 5) {
-      await notify({
-        title: "Yad2 Watcher — בעיה",
-        message: "לא הצלחתי לטעון את החיפוש 5 פעמים ברצף. אולי יש קאפצ'ה. פתח את Yad2 בדפדפן פעם אחת.",
-      });
-    }
-    return { ok: false, reason: fetchResult.reason, captchaStreak: state.captchaStreak };
+    if (state.captchaStreak >= 5) await notify("Yad2 Watcher — בעיה", "לא הצלחתי לטעון מודעות במשך 5 בדיקות רצופות.");
+    return { ok: false, reason: result.reason || "parse-error", captchaStreak: state.captchaStreak };
   }
 
-  let listings;
-  if (fetchResult.method === "nextdata" && fetchResult.json) {
-    const data = parseNextDataJson(fetchResult.json);
-    listings = parseListingsFromNextData(data);
-  } else if (fetchResult.method === "dom" && fetchResult.listings) {
-    listings = fetchResult.listings;
-  }
-
-  if (!listings || listings.length === 0) {
-    console.warn("[yad2-watcher] could not parse listings");
-    return { ok: false, reason: "parse-error" };
-  }
-
-  console.log(`[yad2-watcher] parsed ${listings.length} listings via ${fetchResult.method}`);
-
-  const sorted = sortByRecent(listings);
-
-  const state = await getState();
+  const listings = sortByRecent(result.listings);
   const known = new Set(state.tokens || []);
-  const fresh = sorted.filter((l) => !known.has(l.token));
+  const fresh = listings.filter(item => !known.has(item.token));
 
-  state.tokens = sorted.map((l) => l.token);
-  state.listings = sorted;
+  // Always preserve and update state, including lastCheck and all known tokens.
+  state.tokens = listings.map(item => item.token);
+  state.listings = listings;
   state.lastCheck = Date.now();
   state.captchaStreak = 0;
-
-  // Keep the first run quiet — seed state without a flood of notifications.
   if (!state._seeded) {
     state._seeded = true;
     await saveState(state);
     await setBadge(0);
-    console.log(`[yad2-watcher] seeded with ${sorted.length} listings (no notifications)`);
-    return { ok: true, seeded: true, count: sorted.length, fresh: 0, method: fetchResult.method };
+    return { ok: true, seeded: true, count: listings.length, fresh: 0, method: result.method };
   }
-
   await saveState(state);
   await setBadge(fresh.length);
-
-  if (fresh.length > 0) {
-    console.log(`[yad2-watcher] ${fresh.length} new listing(s)`);
-    await notifyNew(fresh, settings);
-  } else {
-    console.log(`[yad2-watcher] no new listings (${sorted.length} total)`);
-  }
-
-  return { ok: true, count: sorted.length, fresh: fresh.length, method: fetchResult.method };
+  if (fresh.length) await notifyNew(fresh, settings);
+  return { ok: true, count: listings.length, fresh: fresh.length, method: result.method };
 }
 
-/**
- * Notify user of new listings with popup and optional sound
- */
 async function notifyNew(fresh, settings) {
-  if (!settings.enableNotifications) {
-    console.log("[yad2-watcher] notifications disabled");
-    return;
-  }
-
-  const count = fresh.length;
-  const title = count === 1 ? "מודעה חדשה ב-Yad2!" : `${count} מודעות חדשות ב-Yad2!`;
-  const body = fresh
-    .slice(0, 5)
-    .map((l) => {
-      const price = typeof l.price === "number" ? `₪${l.price.toLocaleString()}` : "₪?";
-      return `• ${price} | ${l.year || "?"} | ${l.model}`.trim();
-    })
-    .join("\n");
-  const more = count > 5 ? `\n…ועוד ${count - 5}` : "";
-
-  console.log(`[yad2-watcher] showing notification: "${title}"`);
-
-  // Show popup notification
-  try {
-    await chrome.notifications.create({
-      type: "basic",
-      iconUrl: "icons/icon128.png",
-      title: title,
-      message: body + more,
-      priority: 2,
-      requireInteraction: true,
-    });
-    console.log("[yad2-watcher] notification displayed successfully");
-  } catch (e) {
-    console.error("[yad2-watcher] failed to show notification:", e.message);
-  }
-
-  // Play sound if enabled
-  if (settings.enableSound) {
-    try {
-      await playNotificationSound();
-      console.log("[yad2-watcher] sound played successfully");
-    } catch (e) {
-      console.warn("[yad2-watcher] failed to play sound:", e.message);
-    }
-  }
+  if (settings.enableNotifications === false) return;
+  const title = fresh.length === 1 ? "מודעה חדשה ב-Yad2!" : `${fresh.length} מודעות חדשות ב-Yad2!`;
+  const message = fresh.slice(0, 5).map(item => {
+    const price = typeof item.price === "number" ? `₪${item.price.toLocaleString()}` : "₪?";
+    return `• ${price} | ${item.year || "?"} | ${item.model || "רכב חדש"}`;
+  }).join("\n") + (fresh.length > 5 ? `\n…ועוד ${fresh.length - 5}` : "");
+  await notify(title, message);
 }
-
-/**
- * Play a simple notification sound using Web Audio API
- */
-function playNotificationSound() {
-  return new Promise((resolve, reject) => {
-    try {
-      // Use the offscreen document to play sound
-      chrome.runtime.sendMessage(
-        { type: "play-sound" },
-        (response) => {
-          if (chrome.runtime.lastError) {
-            reject(new Error(chrome.runtime.lastError.message));
-          } else {
-            resolve();
-          }
-        }
-      );
-    } catch (e) {
-      reject(e);
-    }
-  });
+function notify(title, message) {
+  return chrome.notifications.create({ type: "basic", iconUrl: "icons/icon128.png", title, message, priority: 2, requireInteraction: true });
 }
-
-function notify({ title, message }) {
-  return chrome.notifications.create({
-    type: "basic",
-    iconUrl: "icons/icon128.png",
-    title,
-    message,
-    priority: 2,
-    requireInteraction: true,
-  });
-}
-
 async function setBadge(count) {
-  const text = count > 0 ? String(count) : "";
-  await chrome.action.setBadgeText({ text });
+  await chrome.action.setBadgeText({ text: count > 0 ? String(count) : "" });
   await chrome.action.setBadgeBackgroundColor({ color: "#ef4444" });
 }
-
 async function setBadgeError() {
   await chrome.action.setBadgeText({ text: "!" });
   await chrome.action.setBadgeBackgroundColor({ color: "#f59e0b" });
 }
-
-// ---------- alarm scheduling ----------
-
 async function setupAlarm() {
   const settings = await getSettings();
-  const minutes = Math.max(1, settings.pollMinutes || POLL_MINUTES);
   await chrome.alarms.clear(ALARM_NAME);
-  await chrome.alarms.create(ALARM_NAME, { periodInMinutes: minutes });
-  console.log(`[yad2-watcher] alarm set every ${minutes} min`);
+  await chrome.alarms.create(ALARM_NAME, { periodInMinutes: Math.max(1, Number(settings.pollMinutes) || 15) });
 }
 
-// ---------- lifecycle ----------
-
-chrome.runtime.onInstalled.addListener(async () => {
-  await setupAlarm();
-  if (chrome.runtime.openOptionsPage) {
-    chrome.runtime.openOptionsPage();
+chrome.runtime.onInstalled.addListener(async () => { await setupAlarm(); if (chrome.runtime.openOptionsPage) chrome.runtime.openOptionsPage(); });
+chrome.runtime.onStartup.addListener(setupAlarm);
+chrome.alarms.onAlarm.addListener(alarm => { if (alarm.name === ALARM_NAME) pollOnce().catch(console.error); });
+chrome.notifications.onClicked.addListener(async () => { const state = await getState(); if (state.listings?.[0]?.url) chrome.tabs.create({ url: state.listings[0].url }); });
+chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+  if (message?.type === "manual-poll") { pollOnce().then(result => sendResponse({ ok: true, result })).catch(error => sendResponse({ ok: false, error: String(error) })); return true; }
+  if (message?.type === "get-state") { Promise.all([getState(), getSettings()]).then(([state, settings]) => sendResponse({ state, settings })); return true; }
+  if (message?.type === "save-settings" || message?.type === "save-and-poll") {
+    (async () => { await saveSettings(message.settings); await setupAlarm(); const result = message.type === "save-and-poll" ? await pollOnce() : null; sendResponse({ ok: true, result }); })().catch(error => sendResponse({ ok: false, error: String(error) }));
+    return true;
   }
+  if (message?.type === "reset-state") { saveState({ tokens: [], listings: [], lastCheck: null, captchaStreak: 0, _seeded: false }).then(() => setBadge(0)).then(() => sendResponse({ ok: true })); return true; }
 });
-
-chrome.runtime.onStartup.addListener(() => {
-  setupAlarm();
-});
-
-chrome.alarms.onAlarm.addListener((alarm) => {
-  if (alarm.name === ALARM_NAME) {
-    pollOnce().catch((e) => console.error("[yad2-watcher] poll error", e));
-  }
-});
-
-chrome.notifications.onClicked.addListener(async (_id) => {
-  const state = await getState();
-  const fresh = state.listings || [];
-  if (fresh.length > 0) {
-    chrome.tabs.create({ url: fresh[0].url });
-  }
-});
-
-// ---------- messaging ----------
-
-chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
-  if (msg?.type === "manual-poll") {
-    pollOnce()
-      .then((result) => sendResponse({ ok: true, result }))
-      .catch((e) => sendResponse({ ok: false, error: String(e) }));
-    return true;
-  }
-  if (msg?.type === "get-state") {
-    (async () => {
-      const [state, settings] = await Promise.all([getState(), getSettings()]);
-      sendResponse({ state, settings });
-    })();
-    return true;
-  }
-  if (msg?.type === "save-settings") {
-    (async () => {
-      await saveSettings(msg.settings);
-      await setupAlarm();
-      sendResponse({ ok: true });
-    })();
-    return true;
-  }
-  if (msg?.type === "save-and-poll") {
-    (async () => {
-      await saveSettings(msg.settings);
-      await setupAlarm();
-      const result = await pollOnce().catch((e) => ({ ok: false, error: String(e) }));
-      sendResponse({ ok: true, result });
-    })();
-    return true;
-  }
-  if (msg?.type === "reset-state") {
-    (async () => {
-      await saveState({ tokens: [], listings: [], lastCheck: null, captchaStreak: 0, _seeded: false });
-      await setBadge(0);
-      sendResponse({ ok: true });
-    })();
-    return true;
-  }
-  if (msg?.type === "play-sound") {
-    // Play sound in service worker context
-    try {
-      playBeep();
-      sendResponse({ ok: true });
-    } catch (e) {
-      sendResponse({ ok: false, error: e.message });
-    }
-    return true;
-  }
-});
-
-/**
- * Play a beep sound using Web Audio API
- */
-function playBeep() {
-  try {
-    const audioContext = new (window.AudioContext || window.webkitAudioContext)();
-    const oscillator = audioContext.createOscillator();
-    const gainNode = audioContext.createGain();
-    
-    oscillator.connect(gainNode);
-    gainNode.connect(audioContext.destination);
-    
-    oscillator.frequency.value = 800; // 800 Hz beep
-    oscillator.type = 'sine';
-    
-    gainNode.gain.setValueAtTime(0.3, audioContext.currentTime);
-    gainNode.gain.exponentialRampToValueAtTime(0.01, audioContext.currentTime + 0.5);
-    
-    oscillator.start(audioContext.currentTime);
-    oscillator.stop(audioContext.currentTime + 0.5);
-  } catch (e) {
-    console.warn("[yad2-watcher] beep failed:", e.message);
-  }
-}
-
 setupAlarm();
