@@ -18,8 +18,6 @@ async function saveSettings(settings) { await chrome.storage.local.set({ [SETTIN
 async function fetchPage(url) {
   let win;
   try {
-    // MV3 does not provide a truly invisible external webpage window.
-    // Minimized + off-screen is the least visible supported approach.
     win = await chrome.windows.create({
       url,
       type: "popup",
@@ -36,8 +34,6 @@ async function fetchPage(url) {
     finally { try { await chrome.windows.remove(win.id); } catch {} }
   } catch (error) {
     if (win?.id) { try { await chrome.windows.remove(win.id); } catch {} }
-    // Some platforms reject off-screen coordinates. This fallback avoids
-    // focusing the browser, and the tab is removed immediately after parsing.
     let tab;
     try {
       tab = await chrome.tabs.create({ url, active: false });
@@ -63,9 +59,6 @@ async function pollTabForListings(tabId) {
   return { ok: false, reason: "timeout" };
 }
 
-// Yad2 currently uses /item/<token>. Each link itself is the listing card.
-// Do not walk up to a feed container: that caused all ten items to become the
-// first item and mixed the fields of many cars together.
 function extractFromPage() {
   const pageUrl = location.href;
   const pageTitle = document.title || "";
@@ -93,29 +86,41 @@ function extractFromPage() {
     if (seen.has(token)) continue;
     seen.add(token);
 
-    // Important: link is the actual card (for example ultra-plus...__box).
     const card = link;
     const text = (card.textContent || "").replace(/\s+/g, " ").trim();
     const heading = card.querySelector("h1,h2,h3,[class*='title'],[class*='model']");
 
-    // In the current DOM the hand and price have no separator:
-    // "2023 • יד 1115,000 ₪" means hand 1 and price 115,000.
-    const priceAfterHand = text.match(/יד\s*\d+\s*([\d,]+)\s*₪/);
-    const plainPrice = text.match(/([\d,]+)\s*₪/);
-    const priceText = priceAfterHand?.[1] || plainPrice?.[1];
-    const yearMatch = text.match(/\b((?:19|20)\d{2})\s*[•·]/) || text.match(/\b((?:19|20)\d{2})\b/);
-    const handMatch = text.match(/יד\s*(\d+)/);
+    // Extract year and hand from the pattern "2020   •   יד 2"
+    const yearHandMatch = text.match(/\b(20\d{2})\s*[•·]\s*יד\s*(\d+)/);
+    const year = yearHandMatch ? Number(yearHandMatch[1]) : null;
+    const hand = yearHandMatch ? `יד ${yearHandMatch[2]}` : "?";
+
+    // Extract price: look for the LAST occurrence (the actual price, not the discount)
+    // Pattern: "יד X" followed by price
+    let price = null;
+    const allPrices = text.matchAll(/([\d,]+)\s*₪/g);
+    for (const match of allPrices) {
+      price = Number(match[1].replace(/,/g, ""));
+    }
+
+    // Extract km - look for number followed by km/ק״מ indicators
     const kmMatch = text.match(/([\d,]+)\s*(?:ק״מ|ק\"מ|קמ|km)\b/i);
+    const km = kmMatch ? Number(kmMatch[1].replace(/,/g, "")) : null;
+
+    // Extract engine info - look for pattern like "2.0" or "1.5" followed by כ"ס (horsepower)
+    const engineMatch = text.match(/(\d+\.\d+|\d+)\s*\(\s*(\d+)\s*כ״ס/);
+    const engine = engineMatch ? `${engineMatch[1]} (${engineMatch[2]} כ״ס)` : "?";
+
     const area = card.querySelector("[class*='area'],[class*='city'],[class*='location']");
     const image = card.querySelector("img");
 
     listings.push({
       token,
-      price: priceText ? Number(priceText.replace(/,/g, "")) : null,
-      year: yearMatch ? Number(yearMatch[1]) : null,
-      hand: handMatch ? `יד ${handMatch[1]}` : "?",
-      km: kmMatch ? Number(kmMatch[1].replace(/,/g, "")) : null,
-      engine: (text.match(/אוט[׳']?[^\d]{0,3}\d+(?:\.\d+)?\s*\([^)]*כ״ס[^)]*\)/i)?.[0]) || "?",
+      price,
+      year,
+      hand,
+      km,
+      engine,
       submodel: "",
       model: heading?.textContent?.replace(/\s+/g, " ").trim() || "",
       area: area?.textContent?.replace(/\s+/g, " ").trim() || "?",
