@@ -2,32 +2,28 @@ const ALARM_NAME = "yad2-poll";
 const DEFAULT_URL = "https://www.yad2.co.il/vehicles/cars";
 const STATE_KEY = "watcherState";
 const SETTINGS_KEY = "watcherSettings";
-const DEFAULT_SETTINGS = {
-  searchUrl: DEFAULT_URL,
-  pollMinutes: 15,
-  enableNotifications: true,
-  enableSound: false,
-};
+const DEFAULT_SETTINGS = { searchUrl: DEFAULT_URL, pollMinutes: 15, enableNotifications: true, enableSound: false };
 
 async function getState() {
-  const { [STATE_KEY]: state } = await chrome.storage.local.get(STATE_KEY);
-  return state || { tokens: [], listings: [], lastCheck: null, captchaStreak: 0, _seeded: false };
+  const data = await chrome.storage.local.get(STATE_KEY);
+  return data[STATE_KEY] || { tokens: [], listings: [], lastCheck: null, captchaStreak: 0, _seeded: false };
 }
 async function saveState(state) { await chrome.storage.local.set({ [STATE_KEY]: state }); }
 async function getSettings() {
-  const { [SETTINGS_KEY]: settings } = await chrome.storage.local.get(SETTINGS_KEY);
-  return { ...DEFAULT_SETTINGS, ...(settings || {}) };
+  const data = await chrome.storage.local.get(SETTINGS_KEY);
+  return { ...DEFAULT_SETTINGS, ...(data[SETTINGS_KEY] || {}) };
 }
 async function saveSettings(settings) { await chrome.storage.local.set({ [SETTINGS_KEY]: settings }); }
 
-// A popup window positioned outside the desktop is used because MV3 has no
-// general-purpose invisible tab API. It is never focused and is always closed.
 async function fetchPage(url) {
   let win;
   try {
+    // MV3 does not provide a truly invisible external webpage window.
+    // Minimized + off-screen is the least visible supported approach.
     win = await chrome.windows.create({
       url,
       type: "popup",
+      state: "minimized",
       focused: false,
       left: -10000,
       top: -10000,
@@ -35,12 +31,13 @@ async function fetchPage(url) {
       height: 768,
     });
     const tabId = win?.tabs?.[0]?.id;
-    if (!tabId) throw new Error("hidden tab was not created");
+    if (!tabId) throw new Error("hidden window has no tab");
     try { return await pollTabForListings(tabId); }
     finally { try { await chrome.windows.remove(win.id); } catch {} }
   } catch (error) {
     if (win?.id) { try { await chrome.windows.remove(win.id); } catch {} }
-    // Fallback for platforms that reject off-screen popup coordinates.
+    // Some platforms reject off-screen coordinates. This fallback avoids
+    // focusing the browser, and the tab is removed immediately after parsing.
     let tab;
     try {
       tab = await chrome.tabs.create({ url, active: false });
@@ -57,17 +54,18 @@ async function pollTabForListings(tabId) {
     await sleep(attempt === 0 ? 4000 : 2500);
     try {
       const [response] = await chrome.scripting.executeScript({ target: { tabId }, func: extractFromPage });
-      if (response?.result?.ok) return response.result;
-      if (response?.result?.reason === "challenge-page") continue;
-      if (response?.result?.reason === "no-listings-found" || response?.result?.reason === "no-listings-parsed") continue;
-      if (response?.result) return response.result;
+      const result = response?.result;
+      if (result?.ok) return result;
+      if (["challenge-page", "no-listings-found", "no-listings-parsed"].includes(result?.reason)) continue;
+      if (result) return result;
     } catch {}
   }
   return { ok: false, reason: "timeout" };
 }
 
-// Runs inside the Yad2 page. Current Yad2 uses /item/<token>, not
-// /vehicles/item/<token>; both formats are accepted for compatibility.
+// Yad2 currently uses /item/<token>. Each link itself is the listing card.
+// Do not walk up to a feed container: that caused all ten items to become the
+// first item and mixed the fields of many cars together.
 function extractFromPage() {
   const pageUrl = location.href;
   const pageTitle = document.title || "";
@@ -86,82 +84,87 @@ function extractFromPage() {
   const links = Array.from(document.querySelectorAll('a[href*="item/"]'));
   const listings = [];
   const seen = new Set();
+
   for (const link of links) {
     const href = link.getAttribute("href") || "";
-    // Handles /item/g037trj0?... and /vehicles/item/g037trj0?... and absolute URLs.
     const match = href.match(/(?:^|\/)item\/([A-Za-z0-9_-]+)/i);
-    if (!match || seen.has(match[1])) continue;
+    if (!match) continue;
     const token = match[1];
+    if (seen.has(token)) continue;
     seen.add(token);
 
-    let card = link;
-    for (let i = 0; i < 8 && card.parentElement; i++) {
-      card = card.parentElement;
-      const cls = typeof card.className === "string" ? card.className : "";
-      if (/card|feed|listing|item/i.test(cls)) break;
-    }
+    // Important: link is the actual card (for example ultra-plus...__box).
+    const card = link;
     const text = (card.textContent || "").replace(/\s+/g, " ").trim();
     const heading = card.querySelector("h1,h2,h3,[class*='title'],[class*='model']");
-    const priceMatch = text.match(/([\d,]+)\s*₪/);
-    const yearMatch = text.match(/\b((?:19|20)\d{2})\b/);
-    const kmMatch = text.match(/([\d,]+)\s*(?:km|ק״מ|ק\"מ)/i);
+
+    // In the current DOM the hand and price have no separator:
+    // "2023 • יד 1115,000 ₪" means hand 1 and price 115,000.
+    const priceAfterHand = text.match(/יד\s*\d+\s*([\d,]+)\s*₪/);
+    const plainPrice = text.match(/([\d,]+)\s*₪/);
+    const priceText = priceAfterHand?.[1] || plainPrice?.[1];
+    const yearMatch = text.match(/\b((?:19|20)\d{2})\s*[•·]/) || text.match(/\b((?:19|20)\d{2})\b/);
     const handMatch = text.match(/יד\s*(\d+)/);
+    const kmMatch = text.match(/([\d,]+)\s*(?:ק״מ|ק\"מ|קמ|km)\b/i);
     const area = card.querySelector("[class*='area'],[class*='city'],[class*='location']");
+    const image = card.querySelector("img");
+
     listings.push({
       token,
-      price: priceMatch ? Number(priceMatch[1].replace(/,/g, "")) : null,
+      price: priceText ? Number(priceText.replace(/,/g, "")) : null,
       year: yearMatch ? Number(yearMatch[1]) : null,
       hand: handMatch ? `יד ${handMatch[1]}` : "?",
       km: kmMatch ? Number(kmMatch[1].replace(/,/g, "")) : null,
-      engine: "?",
+      engine: (text.match(/אוט[׳']?[^\d]{0,3}\d+(?:\.\d+)?\s*\([^)]*כ״ס[^)]*\)/i)?.[0]) || "?",
       submodel: "",
-      model: heading?.textContent?.trim() || "",
-      area: area?.textContent?.trim() || "?",
+      model: heading?.textContent?.replace(/\s+/g, " ").trim() || "",
+      area: area?.textContent?.replace(/\s+/g, " ").trim() || "?",
       city: "",
       createdAt: "",
       url: new URL(href, location.origin).href,
-      image: card.querySelector("img")?.src || "",
+      image: image?.src || "",
     });
   }
+
   if (!listings.length) return { ok: false, reason: "no-listings-found", debug };
   return { ok: true, method: "dom", listings };
 }
 
 function waitForTabComplete(tabId, timeoutMs) {
   return new Promise((resolve, reject) => {
-    let done = false;
+    let finished = false;
     const finish = (error, tab) => {
-      if (done) return;
-      done = true;
+      if (finished) return;
+      finished = true;
       clearTimeout(timer);
       chrome.tabs.onUpdated.removeListener(listener);
       error ? reject(error) : resolve(tab);
     };
     const timer = setTimeout(() => finish(new Error("tab load timeout")), timeoutMs);
-    const listener = (id, info, tab) => {
-      if (id === tabId && info.status === "complete") finish(null, tab);
-    };
+    const listener = (id, info, tab) => { if (id === tabId && info.status === "complete") finish(null, tab); };
     chrome.tabs.onUpdated.addListener(listener);
-    chrome.tabs.get(tabId).then(tab => tab.status === "complete" ? finish(null, tab) : null).catch(finish);
+    chrome.tabs.get(tabId).then(tab => { if (tab.status === "complete") finish(null, tab); }).catch(error => finish(error));
   });
 }
 function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
-
-function sortByRecent(listings) {
-  return [...listings].sort((a, b) => (new Date(b.createdAt || 0)) - (new Date(a.createdAt || 0)));
-}
+function sortByRecent(items) { return [...items]; }
 
 async function pollOnce() {
   const settings = await getSettings();
-  const url = settings.searchUrl || DEFAULT_URL;
-  let result;
-  try { result = await fetchPage(url); }
-  catch (error) { await setBadgeError(); return { ok: false, reason: "fetch-error", error: String(error) }; }
-
   const state = await getState();
-  if (!result.ok || !result.listings?.length) {
-    state.captchaStreak = (state.captchaStreak || 0) + 1;
+  let result;
+  try { result = await fetchPage(settings.searchUrl || DEFAULT_URL); }
+  catch (error) {
     state.lastCheck = Date.now();
+    state.captchaStreak = (state.captchaStreak || 0) + 1;
+    await saveState(state);
+    await setBadgeError();
+    return { ok: false, reason: "fetch-error", error: String(error) };
+  }
+
+  if (!result.ok || !result.listings?.length) {
+    state.lastCheck = Date.now();
+    state.captchaStreak = (state.captchaStreak || 0) + 1;
     await saveState(state);
     if (state.captchaStreak >= 5) await notify("Yad2 Watcher — בעיה", "לא הצלחתי לטעון מודעות במשך 5 בדיקות רצופות.");
     return { ok: false, reason: result.reason || "parse-error", captchaStreak: state.captchaStreak };
@@ -170,12 +173,11 @@ async function pollOnce() {
   const listings = sortByRecent(result.listings);
   const known = new Set(state.tokens || []);
   const fresh = listings.filter(item => !known.has(item.token));
-
-  // Always preserve and update state, including lastCheck and all known tokens.
   state.tokens = listings.map(item => item.token);
   state.listings = listings;
   state.lastCheck = Date.now();
   state.captchaStreak = 0;
+
   if (!state._seeded) {
     state._seeded = true;
     await saveState(state);
@@ -188,13 +190,13 @@ async function pollOnce() {
   return { ok: true, count: listings.length, fresh: fresh.length, method: result.method };
 }
 
-async function notifyNew(fresh, settings) {
+async function notifyNew(items, settings) {
   if (settings.enableNotifications === false) return;
-  const title = fresh.length === 1 ? "מודעה חדשה ב-Yad2!" : `${fresh.length} מודעות חדשות ב-Yad2!`;
-  const message = fresh.slice(0, 5).map(item => {
+  const title = items.length === 1 ? "מודעה חדשה ב-Yad2!" : `${items.length} מודעות חדשות ב-Yad2!`;
+  const message = items.slice(0, 5).map(item => {
     const price = typeof item.price === "number" ? `₪${item.price.toLocaleString()}` : "₪?";
     return `• ${price} | ${item.year || "?"} | ${item.model || "רכב חדש"}`;
-  }).join("\n") + (fresh.length > 5 ? `\n…ועוד ${fresh.length - 5}` : "");
+  }).join("\n") + (items.length > 5 ? `\n…ועוד ${items.length - 5}` : "");
   await notify(title, message);
 }
 function notify(title, message) {
