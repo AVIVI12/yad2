@@ -56,17 +56,16 @@ async function saveSettings(settings) {
 async function fetchPage(url) {
   let win;
   try {
-    // Create the window off-screen so it never flashes on the user's display.
-    // Using state: "minimized" still briefly shows the window before minimizing.
+    // Create the window completely off-screen and truly hidden
     win = await chrome.windows.create({
       url: "about:blank",
       type: "popup",
-      state: "minimized",
+      state: "normal",
       focused: false,
-      width: 1,
-      height: 1,
-      left: -2000,
-      top: -2000,
+      width: 800,
+      height: 600,
+      left: -9999,
+      top: -9999,
     });
     // Now navigate the tab to the real URL — the window is already hidden.
     const tabId = win.tabs[0].id;
@@ -134,7 +133,7 @@ async function pollTabForListings(tabId) {
     try {
       await waitForTabComplete(tabId, 20000);
     } catch (e) {
- // timeout — try extraction anyway
+  // timeout — try extraction anyway
     }
 
     // Give the page time to render after load.
@@ -555,38 +554,42 @@ async function notifyNew(fresh, settings) {
     .join("\n");
   const more = count > 5 ? `\n…ועוד ${count - 5}` : "";
 
+  // Show notification using Chrome Notifications API
   await notify({ title, message: body + more });
 
+  // Also try to play a sound if enabled
   if (settings.enableSound) {
     try {
-      await self.registration.showNotification(title, {
-        body: body + more,
-        icon: "icons/icon128.png",
-        badge: "icons/icon48.png",
-        tag: "yad2-new",
-        renotify: true,
-        requireInteraction: true,
-      });
+      // Play a simple beep sound (using a Web Audio API approach)
+      const audioContext = new (window.AudioContext || window.webkitAudioContext)();
+      const oscillator = audioContext.createOscillator();
+      const gainNode = audioContext.createGain();
+      
+      oscillator.connect(gainNode);
+      gainNode.connect(audioContext.destination);
+      
+      oscillator.frequency.value = 800;
+      oscillator.type = 'sine';
+      
+      gainNode.gain.setValueAtTime(0.3, audioContext.currentTime);
+      gainNode.gain.exponentialRampToValueAtTime(0.01, audioContext.currentTime + 0.5);
+      
+      oscillator.start(audioContext.currentTime);
+      oscillator.stop(audioContext.currentTime + 0.5);
     } catch (e) {
-      // showNotification may not be available in all contexts
+      console.warn("[yad2-watcher] sound playback failed:", e.message);
     }
   }
 }
 
 function notify({ title, message }) {
-  return new Promise((resolve) => {
-    try {
-      chrome.notifications.create({
-        type: "basic",
-        iconUrl: "icons/icon128.png",
-        title,
-        message,
-        priority: 2,
-        requireInteraction: true,
-      }, () => resolve());
-    } catch (e) {
-      resolve();
-    }
+  return chrome.notifications.create({
+    type: "basic",
+    iconUrl: "icons/icon128.png",
+    title,
+    message,
+    priority: 2,
+    requireInteraction: true,
   });
 }
 
