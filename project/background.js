@@ -46,74 +46,82 @@ async function saveSettings(settings) {
   await chrome.storage.local.set({ [SETTINGS_KEY]: settings });
 }
 
-// ---------- fetch via hidden window ----------
+// ---------- fetch via truly hidden window ----------
 
 /**
- * Open a minimized (truly hidden) browser window, let Yad2's JS challenge
+ * Open a truly hidden window far off-screen, let Yad2's JS challenge
  * resolve naturally, then poll the page content until listings appear.
  * Tries __NEXT_DATA__ first, falls back to DOM card parsing.
+ * Closes window after polling completes.
  */
 async function fetchPage(url) {
   let win;
+  let tabId;
+  let winId;
+  
   try {
-    // Create the window completely off-screen and truly hidden
+    // Create the window completely off-screen (far to the left and top)
+    // Using a normal popup window positioned outside viewport
     win = await chrome.windows.create({
       url: "about:blank",
       type: "popup",
-      state: "normal",
       focused: false,
-      width: 800,
-      height: 600,
-      left: -9999,
-      top: -9999,
+      width: 1024,
+      height: 768,
+      left: -10000,    // Far off-screen to the left
+      top: -10000,     // Far off-screen to the top
     });
-    // Now navigate the tab to the real URL — the window is already hidden.
-    const tabId = win.tabs[0].id;
+    
+    tabId = win.tabs[0].id;
+    winId = win.id;
+    
+    if (!tabId || !winId) {
+      throw new Error("Failed to create window/tab");
+    }
+
+    // Navigate to the actual URL
     await chrome.tabs.update(tabId, { url });
+    
+    console.log(`[yad2-watcher] opened hidden window at tab ${tabId}, window ${winId}`);
+    
   } catch (e) {
-    // Fallback: try a plain inactive tab.
+    console.error("[yad2-watcher] failed to create hidden window:", e);
+    
+    // Fallback: try a plain inactive tab
     let fallbackTab;
     try {
       fallbackTab = await chrome.tabs.create({ url, active: false });
-      return await pollTabForListings(fallbackTab.id);
-    } catch (e2) {
-      throw new Error("cannot open tab or window: " + e2.message);
-    } finally {
-      if (fallbackTab?.id) {
-        try {
-          await chrome.tabs.remove(fallbackTab.id);
-        } catch (e3) {
-          // already closed
+      tabId = fallbackTab.id;
+      
+      try {
+        const result = await pollTabForListings(tabId);
+        return result;
+      } finally {
+        if (tabId) {
+          try {
+            await chrome.tabs.remove(tabId);
+          } catch (e3) {
+            // already closed
+          }
         }
       }
+    } catch (e2) {
+      throw new Error("cannot open tab or window: " + e2.message);
     }
   }
 
-  const tabId = win?.tabs?.[0]?.id;
-  const winId = win?.id;
-  if (!tabId || !winId) {
-    throw new Error("browser created no background window");
-  }
-  // Re-read tab to confirm it got the URL.
-  try {
-    const tab = await chrome.tabs.get(tabId);
-    if (!tab.url || tab.url === "about:blank") {
-      await chrome.tabs.update(tabId, { url });
-    }
-  } catch (e) {
-    // tab read failed — proceed anyway
-    }
-
+  // Poll the hidden tab
   try {
     return await pollTabForListings(tabId);
   } finally {
-    try {
-      await chrome.windows.remove(winId);
-    } catch (e) {
+    // Clean up: close the window
+    if (winId) {
       try {
-        await chrome.tabs.remove(tabId);
-      } catch (e2) {
-        // already gone
+        await chrome.windows.remove(winId);
+        console.log(`[yad2-watcher] closed hidden window ${winId}`);
+      } catch (e) {
+        // Window already closed
+        console.warn(`[yad2-watcher] failed to close window ${winId}:`, e.message);
       }
     }
   }
@@ -133,7 +141,8 @@ async function pollTabForListings(tabId) {
     try {
       await waitForTabComplete(tabId, 20000);
     } catch (e) {
-  // timeout — try extraction anyway
+      // timeout — try extraction anyway
+      console.warn(`[yad2-watcher] tab load timeout on attempt ${attempt + 1}:`, e.message);
     }
 
     // Give the page time to render after load.
@@ -152,11 +161,13 @@ async function pollTabForListings(tabId) {
     }
 
     if (!result || !result.result) {
+      console.warn(`[yad2-watcher] attempt ${attempt + 1}: no result returned`);
       continue;
     }
 
     const r = result.result;
     if (r.ok) {
+      console.log(`[yad2-watcher] successfully extracted listings on attempt ${attempt + 1}`);
       return r;
     }
 
@@ -173,9 +184,11 @@ async function pollTabForListings(tabId) {
     }
 
     // Any other error — return it.
+    console.warn(`[yad2-watcher] attempt ${attempt + 1}: error reason: ${r.reason}`);
     return r;
   }
 
+  console.error("[yad2-watcher] polling timeout after all attempts");
   return { ok: false, reason: "timeout" };
 }
 
@@ -198,10 +211,10 @@ function extractFromPage() {
     linkCount: document.querySelectorAll("a").length,
     bodyLength: document.body?.textContent?.length || 0,
     hasNextData: !!document.getElementById("__NEXT_DATA__"),
-  bodySnippet: (document.body?.textContent || "").slice(0, 300),
-  itemLinks: document.querySelectorAll('a[href*="vehicles/item"]').length,
+    bodySnippet: (document.body?.textContent || "").slice(0, 300),
+    itemLinks: document.querySelectorAll('a[href*="vehicles/item"]').length,
     itemLinks2: document.querySelectorAll('a[href*="/vehicles/item/"]').length,
-  allHrefs: Array.from(document.querySelectorAll("a[href]"))
+    allHrefs: Array.from(document.querySelectorAll("a[href]"))
       .map((a) => a.getAttribute("href"))
       .filter((h) => h && h.includes("item"))
       .slice(0, 5),
@@ -540,8 +553,14 @@ async function pollOnce() {
   return { ok: true, count: sorted.length, fresh: fresh.length, method: fetchResult.method };
 }
 
+/**
+ * Notify user of new listings with popup and optional sound
+ */
 async function notifyNew(fresh, settings) {
-  if (!settings.enableNotifications) return;
+  if (!settings.enableNotifications) {
+    console.log("[yad2-watcher] notifications disabled");
+    return;
+  }
 
   const count = fresh.length;
   const title = count === 1 ? "מודעה חדשה ב-Yad2!" : `${count} מודעות חדשות ב-Yad2!`;
@@ -554,32 +573,55 @@ async function notifyNew(fresh, settings) {
     .join("\n");
   const more = count > 5 ? `\n…ועוד ${count - 5}` : "";
 
-  // Show notification using Chrome Notifications API
-  await notify({ title, message: body + more });
+  console.log(`[yad2-watcher] showing notification: "${title}"`);
 
-  // Also try to play a sound if enabled
+  // Show popup notification
+  try {
+    await chrome.notifications.create({
+      type: "basic",
+      iconUrl: "icons/icon128.png",
+      title: title,
+      message: body + more,
+      priority: 2,
+      requireInteraction: true,
+    });
+    console.log("[yad2-watcher] notification displayed successfully");
+  } catch (e) {
+    console.error("[yad2-watcher] failed to show notification:", e.message);
+  }
+
+  // Play sound if enabled
   if (settings.enableSound) {
     try {
-      // Play a simple beep sound (using a Web Audio API approach)
-      const audioContext = new (window.AudioContext || window.webkitAudioContext)();
-      const oscillator = audioContext.createOscillator();
-      const gainNode = audioContext.createGain();
-      
-      oscillator.connect(gainNode);
-      gainNode.connect(audioContext.destination);
-      
-      oscillator.frequency.value = 800;
-      oscillator.type = 'sine';
-      
-      gainNode.gain.setValueAtTime(0.3, audioContext.currentTime);
-      gainNode.gain.exponentialRampToValueAtTime(0.01, audioContext.currentTime + 0.5);
-      
-      oscillator.start(audioContext.currentTime);
-      oscillator.stop(audioContext.currentTime + 0.5);
+      await playNotificationSound();
+      console.log("[yad2-watcher] sound played successfully");
     } catch (e) {
-      console.warn("[yad2-watcher] sound playback failed:", e.message);
+      console.warn("[yad2-watcher] failed to play sound:", e.message);
     }
   }
+}
+
+/**
+ * Play a simple notification sound using Web Audio API
+ */
+function playNotificationSound() {
+  return new Promise((resolve, reject) => {
+    try {
+      // Use the offscreen document to play sound
+      chrome.runtime.sendMessage(
+        { type: "play-sound" },
+        (response) => {
+          if (chrome.runtime.lastError) {
+            reject(new Error(chrome.runtime.lastError.message));
+          } else {
+            resolve();
+          }
+        }
+      );
+    } catch (e) {
+      reject(e);
+    }
+  });
 }
 
 function notify({ title, message }) {
@@ -682,6 +724,41 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     })();
     return true;
   }
+  if (msg?.type === "play-sound") {
+    // Play sound in service worker context
+    try {
+      playBeep();
+      sendResponse({ ok: true });
+    } catch (e) {
+      sendResponse({ ok: false, error: e.message });
+    }
+    return true;
+  }
 });
+
+/**
+ * Play a beep sound using Web Audio API
+ */
+function playBeep() {
+  try {
+    const audioContext = new (window.AudioContext || window.webkitAudioContext)();
+    const oscillator = audioContext.createOscillator();
+    const gainNode = audioContext.createGain();
+    
+    oscillator.connect(gainNode);
+    gainNode.connect(audioContext.destination);
+    
+    oscillator.frequency.value = 800; // 800 Hz beep
+    oscillator.type = 'sine';
+    
+    gainNode.gain.setValueAtTime(0.3, audioContext.currentTime);
+    gainNode.gain.exponentialRampToValueAtTime(0.01, audioContext.currentTime + 0.5);
+    
+    oscillator.start(audioContext.currentTime);
+    oscillator.stop(audioContext.currentTime + 0.5);
+  } catch (e) {
+    console.warn("[yad2-watcher] beep failed:", e.message);
+  }
+}
 
 setupAlarm();
